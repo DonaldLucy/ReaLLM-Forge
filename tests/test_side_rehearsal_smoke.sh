@@ -14,12 +14,11 @@ COMMON_ARGS=(
   --dataset "${DATASET}"
   --device cpu
   --dtype float32
-  --compile false
-  --tensorboard_log false
-  --wandb_log false
-  --csv_log true
+  --no-compile
+  --no-tensorboard_log
+  --no-wandb_log
   --csv_dir "${CSV_DIR}"
-  --max_iters 12
+  --max_iters 1200
   --eval_interval 6
   --eval_iters 6
   --log_interval 2

@@ -1,7 +1,6 @@
 import argparse
 import csv
 import json
-import math
 import os
 
 import matplotlib.pyplot as plt
@@ -76,6 +75,27 @@ def load_side_csv(path):
     return rows
 
 
+def rolling_metric_by_iter(rows, value_key, window_iters):
+    if not rows:
+        return np.array([]), np.array([])
+
+    iters = np.asarray([row["iter"] for row in rows], dtype=float)
+    values = np.asarray([row[value_key] for row in rows], dtype=float)
+
+    rolled = np.empty_like(values, dtype=float)
+    left = 0
+    running_sum = 0.0
+
+    for right in range(len(rows)):
+        running_sum += values[right]
+        while iters[right] - iters[left] >= window_iters:
+            running_sum -= values[left]
+            left += 1
+        rolled[right] = running_sum / (right - left + 1)
+
+    return iters, rolled
+
+
 def summarize_run(run):
     best_idx = int(np.nanargmin(run["val_loss"]))
     return {
@@ -143,12 +163,33 @@ def plot_report(baseline, rehearsal, side_rows, args):
     if side_rows:
         side_iters = np.asarray([row["iter"] for row in side_rows], dtype=float)
         side_delta = np.asarray([row["delta"] for row in side_rows], dtype=float)
-        side_accept = np.asarray([row["accepted"] for row in side_rows], dtype=float)
-        axes[1, 1].plot(side_iters, side_delta, marker="o", linewidth=2.0, label="base loss - candidate loss")
+        axes[1, 1].plot(
+            side_iters,
+            side_delta,
+            marker="o",
+            linewidth=1.0,
+            alpha=0.35,
+            label="instant delta",
+        )
+        roll_delta_iters, roll_delta = rolling_metric_by_iter(side_rows, "delta", args.side_window_iters)
+        axes[1, 1].plot(
+            roll_delta_iters,
+            roll_delta,
+            linewidth=2.5,
+            color="tab:blue",
+            label=f"rolling delta ({args.side_window_iters} iter)",
+        )
         axes[1, 1].axhline(0.0, color="black", linewidth=1.0, alpha=0.5)
-        acceptance_rate = np.cumsum(side_accept) / np.arange(1, len(side_accept) + 1)
+        roll_accept_iters, rolling_acceptance = rolling_metric_by_iter(side_rows, "accepted", args.side_window_iters)
         ax2 = axes[1, 1].twinx()
-        ax2.plot(side_iters, acceptance_rate, color="tab:orange", linestyle="--", linewidth=2.0, label="acceptance rate")
+        ax2.plot(
+            roll_accept_iters,
+            rolling_acceptance,
+            color="tab:orange",
+            linestyle="--",
+            linewidth=2.5,
+            label=f"rolling acceptance ({args.side_window_iters} iter)",
+        )
         axes[1, 1].set_xlabel("Iteration")
         axes[1, 1].set_ylabel("Loss improvement")
         ax2.set_ylabel("Acceptance rate")
@@ -184,11 +225,16 @@ def plot_report(baseline, rehearsal, side_rows, args):
         },
     }
     if side_rows:
+        _, rolling_acceptance = rolling_metric_by_iter(side_rows, "accepted", args.side_window_iters)
+        _, rolling_delta = rolling_metric_by_iter(side_rows, "delta", args.side_window_iters)
         summary["side_rehearsal"] = {
             "num_updates": len(side_rows),
             "mean_delta": float(np.mean([row["delta"] for row in side_rows])),
             "acceptance_rate": float(np.mean([row["accepted"] for row in side_rows])),
             "max_snapshot_mb": float(np.max([row["snapshot_mb"] for row in side_rows])),
+            f"rolling_acceptance_last_{args.side_window_iters}iter": float(rolling_acceptance[-1]),
+            f"rolling_acceptance_best_{args.side_window_iters}iter": float(np.max(rolling_acceptance)),
+            f"rolling_delta_last_{args.side_window_iters}iter": float(rolling_delta[-1]),
         }
     summary_path = os.path.join(args.out_dir, "side_rehearsal_summary.json")
     with open(summary_path, "w") as file:
@@ -205,6 +251,7 @@ def main():
     parser.add_argument("--rehearsal_label", default="Side rehearsal")
     parser.add_argument("--title", default="Side-Rehearsal QAT Report")
     parser.add_argument("--out_dir", default="plots/side_rehearsal")
+    parser.add_argument("--side_window_iters", type=int, default=400)
     args = parser.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)

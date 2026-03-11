@@ -19,8 +19,18 @@ BlockForward = Callable[['Block', torch.Tensor, int], torch.Tensor]
 # Residual combination helpers
 # -----------------------
 
+def _align_residual_batch(x: torch.Tensor, out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    if x.size(0) == out.size(0):
+        return x, out
+    if x.size(0) < out.size(0):
+        delta = out.size(0) - x.size(0)
+        return torch.cat((x, x[:delta]), dim=0), out
+    delta = x.size(0) - out.size(0)
+    return x, torch.cat((out, out[:delta]), dim=0)
+
 def slerp(a: torch.Tensor, b: torch.Tensor, alpha: float, eps: float) -> torch.Tensor:
     """Spherical linear interpolation between tensors ``a`` and ``b``."""
+    a, b = _align_residual_batch(a, b)
     a_norm = a / a.norm(dim=-1, keepdim=True)
     b_norm = b / b.norm(dim=-1, keepdim=True)
     dot = (a_norm * b_norm).sum(dim=-1, keepdim=True).clamp(-1.0, 1.0)
@@ -36,14 +46,17 @@ def slerp(a: torch.Tensor, b: torch.Tensor, alpha: float, eps: float) -> torch.T
 
 
 def add_residual(x: torch.Tensor, out: torch.Tensor, alpha: torch.Tensor, eps: float) -> torch.Tensor:
+    x, out = _align_residual_batch(x, out)
     return x + out
 
 
 def lerp_residual(x: torch.Tensor, out: torch.Tensor, alpha: torch.Tensor, eps: float) -> torch.Tensor:
+    x, out = _align_residual_batch(x, out)
     return (1 - alpha) * x + alpha * (x + out)
 
 
 def slerp_residual(x: torch.Tensor, out: torch.Tensor, alpha: torch.Tensor, eps: float) -> torch.Tensor:
+    x, out = _align_residual_batch(x, out)
     return slerp(x, x + out, alpha, eps)
 
 

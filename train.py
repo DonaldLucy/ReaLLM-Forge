@@ -20,6 +20,7 @@ import inspect
 import random
 from utils.bit_allocation_logger import BitAllocationLogger
 from utils.bit_logger import BitLogger
+from typing import Optional
 
 
 from train_variations.optimizer_variants import (
@@ -74,7 +75,7 @@ import numpy as np
 
 
 # Learned Gradient
-from quantization.quant_linear import replace_linear_with_quantlinear
+# from quantization.quant_linear import replace_linear_with_quantlinear
 import torch.nn.utils.stateless as stateless
 
 # Bit-balanced adaptive learner
