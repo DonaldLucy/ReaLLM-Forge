@@ -40,6 +40,7 @@ from variations.router_variations import router_dictionary
 from variations.output_vector_variants import output_vector_variant_dict
 from quantization.quantize import quantize_dictionary, dequantize, fake_quantize_act
 from quantization.quant_utils import set_variant, create_activation_buffers
+from quantization.side_rehearsal import get_active_piggyback_context
 
 from initializations.initialization_variations import init_dictionary
 
@@ -573,10 +574,44 @@ class GPT(nn.Module):
                     logits = torch.tanh(logits)
                     logits = logits * self.config.final_logit_softcapping
 
-                if loss_fn is None:
-                    loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                piggyback_ctx = get_active_piggyback_context()
+                if piggyback_ctx is not None and piggyback_ctx.has_probe:
+                    base_logits = logits[:piggyback_ctx.base_batch_size]
+                    probe_logits = base_logits[:piggyback_ctx.injected_k]
+                    candidate_logits = logits[piggyback_ctx.base_batch_size: piggyback_ctx.base_batch_size + piggyback_ctx.injected_k]
+                    probe_targets = targets[:piggyback_ctx.injected_k]
+
+                    if loss_fn is None:
+                        loss = F.cross_entropy(
+                            base_logits.view(-1, base_logits.size(-1)),
+                            targets.view(-1),
+                            ignore_index=-1,
+                        )
+                        base_probe_loss = F.cross_entropy(
+                            probe_logits.view(-1, probe_logits.size(-1)),
+                            probe_targets.view(-1),
+                            ignore_index=-1,
+                        )
+                        candidate_probe_loss = F.cross_entropy(
+                            candidate_logits.view(-1, candidate_logits.size(-1)),
+                            probe_targets.view(-1),
+                            ignore_index=-1,
+                        )
+                    else:
+                        loss = loss_fn(base_logits, targets, iter_num=iter_num)
+                        base_probe_loss = loss_fn(probe_logits, probe_targets, iter_num=iter_num)
+                        candidate_probe_loss = loss_fn(candidate_logits, probe_targets, iter_num=iter_num)
+
+                    piggyback_ctx.set_probe_losses(
+                        base_probe_loss=base_probe_loss,
+                        candidate_probe_loss=candidate_probe_loss,
+                    )
+                    logits = base_logits
                 else:
-                    loss = loss_fn(logits, targets, iter_num=iter_num)
+                    if loss_fn is None:
+                        loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+                    else:
+                        loss = loss_fn(logits, targets, iter_num=iter_num)
             else:
                 # inference-time mini-optimization: only forward the lm_head on the very last position
                 if self.config.multidataset_wte and dataset_idx is not None:

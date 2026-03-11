@@ -1303,6 +1303,49 @@ def parse_args():
     training_group.add_argument('--use_linear_fakequant', default=False, action=argparse.BooleanOptionalAction,
                             help="Start standard quantization (STE)")
 
+    model_group.add_argument(
+        '--use_side_rehearsal',
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help="Evaluate a learned replacement gradient on the next batch via piggyback rehearsal.",
+    )
+    model_group.add_argument(
+        '--side_rehearsal_targets',
+        nargs='+',
+        default=None,
+        help="Target QuantizedLinear module path(s), or alias 'last_mlp_down'.",
+    )
+    training_group.add_argument(
+        '--side_rehearsal_hidden',
+        type=int,
+        default=32,
+        help="Hidden width of the two-layer side-network MLP.",
+    )
+    training_group.add_argument(
+        '--side_rehearsal_lr',
+        type=float,
+        default=1e-4,
+        help="Learning rate for the side-network optimizer.",
+    )
+    training_group.add_argument(
+        '--side_rehearsal_every',
+        type=int,
+        default=10,
+        help="Capture a candidate gradient every N optimizer steps.",
+    )
+    training_group.add_argument(
+        '--side_rehearsal_piggyback_ratio',
+        type=float,
+        default=0.25,
+        help="Fraction of the next batch used for piggyback rehearsal.",
+    )
+    training_group.add_argument(
+        '--side_rehearsal_commit',
+        default=True,
+        action=argparse.BooleanOptionalAction,
+        help="If candidate loss improves, replace the target weight before the optimizer step.",
+    )
+
 
     
     # Optimizer args

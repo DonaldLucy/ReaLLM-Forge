@@ -7,6 +7,7 @@ from typing import Optional
 from .activation_variations import *
 from functools import lru_cache
 from quantization.quantize import _fake_quantize, quantize_dictionary, dequantize
+from quantization.side_rehearsal import get_active_piggyback_context
 
 class WrappedLinear(nn.Linear):
     """ Adapts nn.Linear to add 'config' parameter for interface polymorphism"""
@@ -21,6 +22,7 @@ class QuantizedLinear(nn.Linear):
 
     def __init__(self, in_features, out_features, config=None, method="affine_quant", bits=8, bias=True):
         super().__init__(in_features, out_features, bias)
+        self.module_path = None
 
         self.weight_bits = bits
         self.quant_method = method
@@ -48,16 +50,32 @@ class QuantizedLinear(nn.Linear):
         self.register_buffer("weight_norm", None)
         self.register_buffer("weight_zero_point", torch.tensor([0]))
 
+    def _compute_train_weight(self, weight: torch.Tensor, step_value: float, cache_attr: bool = False) -> torch.Tensor:
+        if step_value > self.warmup_step:
+            quantized_weight = _fake_quantize(
+                weight,
+                self.training,
+                self.quant_scheduler,
+                self.start_quant_level,
+                self.full_quant_iteration,
+                self.eval_interval,
+                step_value,
+                self.weight_bits,
+                self.quant_method,
+            )
+            if cache_attr:
+                self._fake_quantized_weight = quantized_weight
+            return quantized_weight
+        if cache_attr:
+            self._fake_quantized_weight = None
+        return weight
+
     def training_quantized_forward(self, input):
-        """Fake quantizes weights. Function should only be used while training"""
+        """Fake quantizes weights. Function should only be used while training."""
         assert self.training, "Should be called only during training"
-
-        # Applies the fake quantization to the weights
-        self._fake_quantized_weight = _fake_quantize(self.weight, self.training, self.quant_scheduler, self.start_quant_level, self.full_quant_iteration, self.eval_interval, self._step.item(), self.weight_bits, self.quant_method)
-        # Uses the quantized weights to compute the output using F.linear
-        out = F.linear(input, self._fake_quantized_weight, self.bias)
-
-        return out
+        step_value = float(self._step.item())
+        weight = self._compute_train_weight(self.weight, step_value, cache_attr=True)
+        return F.linear(input, weight, self.bias)
 
     def inference_quantized_forward(self, input):
         """Simulate quantized inference. Function should be called only during inference"""
@@ -88,10 +106,22 @@ class QuantizedLinear(nn.Linear):
     def forward(self, input):
         """Passes the input through the model during training and inference"""
         if self.training:
-            if self._step > self.warmup_step:
-                out = self.training_quantized_forward(input)
-            else:
-                out = super().forward(input)
+            step_value = float(self._step.item())
+            weight = self._compute_train_weight(self.weight, step_value, cache_attr=True)
+            out = F.linear(input, weight, self.bias)
+
+            piggyback_ctx = get_active_piggyback_context()
+            if piggyback_ctx is not None and piggyback_ctx.should_inject(self.module_path, input.size(0)):
+                actual_k = min(piggyback_ctx.piggyback_k, input.size(0))
+                candidate_weight = piggyback_ctx.build_candidate_weight(
+                    device=self.weight.device,
+                    dtype=self.weight.dtype,
+                )
+                candidate_weight = self._compute_train_weight(candidate_weight, step_value, cache_attr=False)
+                candidate_out = F.linear(input[:actual_k], candidate_weight, self.bias)
+                out = torch.cat((out, candidate_out), dim=0)
+                piggyback_ctx.mark_injected(actual_k)
+
             self._step += 1
         else:
             # Prepares the model for inference by quantizing weights and bias

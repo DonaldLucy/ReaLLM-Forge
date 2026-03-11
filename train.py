@@ -72,10 +72,19 @@ from utils.gns_monitoring.hook import (add_hooks_to_model, add_sogns_hooks,
 
 import numpy as np
 
+
+# Learned Gradient
+from quantization.quant_linear import replace_linear_with_quantlinear
+import torch.nn.utils.stateless as stateless
+
+# Bit-balanced adaptive learner
+from utils.bit_usage import count_tracked_parameters
+
 # Torch
 import torch
 import torch.onnx
 import torch.nn.functional as F
+import torch.distributed as dist
 from torch.distributed import destroy_process_group, init_process_group
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.tensorboard import SummaryWriter
@@ -88,6 +97,13 @@ from model import GPT, GPTConfig
 import tiktoken
 
 from train_args import parse_args
+from quantization.side_rehearsal import (
+    SideRehearsalCollection,
+    PendingRehearsalState,
+    PiggybackContext,
+    activate_piggyback_context,
+)
+from variations.linear_variations import QuantizedLinear
 
 class Trainer:
 
@@ -202,6 +218,16 @@ class Trainer:
         if self.args.lr_decay_match_max_iters:
             self.args.lr_decay_iters = self.args.max_iters
 
+        # Learned-Gradient 
+        self.quantizers = []              
+        self.theta_opt = None             
+        self.weight_param_groups = []
+        self.side_rehearsal = None
+        self.side_rehearsal_opt = None
+        self.side_rehearsal_targets = []
+        self.side_rehearsal_pending = {}
+        self.side_rehearsal_last_eval = None
+        
         self.setup()
 
         if self.args.sample_only:
@@ -238,6 +264,10 @@ class Trainer:
         print("seed: ", self.args.seed)
         print("seed offset: ", self.seed_offset)
         torch.manual_seed(self.args.seed + self.seed_offset)
+
+        random.seed(self.args.seed + self.seed_offset)
+        np.random.seed(self.args.seed + self.seed_offset)
+        torch.cuda.manual_seed_all(self.args.seed + self.seed_offset)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
@@ -294,9 +324,12 @@ class Trainer:
                             self.dataset_perm[d] = np.arange(available)
                         self.dataset_ptr[d] = 0
 
-            gptconf = GPTConfig(**self.model_args)
+            gptconf = GPTConfig(**self._filter_gptconfig_kwargs(self.model_args))
             self.model = GPT(gptconf)
             self.model.to(self.device)
+            
+            self._maybe_enable_learned_gradient()
+            self._maybe_enable_side_rehearsal()
 
             self.iter_num = 0 # for starting from scratch
             self.best_val_loss = 1e9 # really big number
@@ -328,7 +361,7 @@ class Trainer:
                 self.model_args[k] = altered_model_args[k]
 
             self.load_data()
-            gptconf = GPTConfig(**self.model_args)
+            gptconf = GPTConfig(**self._filter_gptconfig_kwargs(self.model_args))
             self.model = GPT(gptconf)
 
             ## TODO: Add ability here to swap WTE factors.
@@ -344,6 +377,10 @@ class Trainer:
                 self.model.freeze_non_lsv_parameters()
 
             self.model.to(self.device)
+            
+            self._maybe_enable_learned_gradient()
+            self._maybe_enable_side_rehearsal()
+            
             # Ensure optimizer and scheduler are initialized before loading state
             self.optimizer = self.create_optimizer()
             self.scaler = torch.amp.GradScaler(self.device_type, enabled=(self.args.dtype == 'float16'))
@@ -354,6 +391,13 @@ class Trainer:
                 self.optimizer.load_state_dict(checkpoint["optimizer"])
             else:
                 print("Warning: No optimizer state found in checkpoint. Using newly initialized optimizer.")
+
+            if (
+                self.side_rehearsal_opt is not None
+                and "side_rehearsal_optimizer" in checkpoint
+                and checkpoint["side_rehearsal_optimizer"] is not None
+            ):
+                self.side_rehearsal_opt.load_state_dict(checkpoint["side_rehearsal_optimizer"])
 
             if "scheduler" in checkpoint and checkpoint["scheduler"] is not None and self.scheduler is not None:
                 self.scheduler.load_state_dict(checkpoint["scheduler"])
@@ -375,9 +419,13 @@ class Trainer:
             for k in variation_dict:
                 self.model_args[k] = variation_dict[k]
 
-            gptconf = GPTConfig(**self.model_args)
+            gptconf = GPTConfig(**self._filter_gptconfig_kwargs(self.model_args))
             self.model = GPT.from_pretrained(gptconf, model_type=self.args.gpt2_type)
             self.model.to(self.device)
+            
+            self._maybe_enable_learned_gradient()
+            self._maybe_enable_side_rehearsal()
+            
             self.load_data()
 
             if self.args.lsv_focused_training:
@@ -423,6 +471,8 @@ class Trainer:
             self.model = DDP(self.model, device_ids=[self.ddp_local_rank])
 
         self.raw_model = self.model.module if self.ddp else self.model
+        if getattr(self.args, "use_side_rehearsal", False) and hasattr(self.raw_model, "side_rehearsal"):
+            self.side_rehearsal = self.raw_model.side_rehearsal
 
         # -----------------------------
         # (1) Decide run_name EARLY (even if tensorboard_log is False)
@@ -502,6 +552,14 @@ class Trainer:
             wandb.init(project=self.args.wandb_project, name=self.args.wandb_run_name, config=self.args)
         self.load_tokenizer()
 
+    def _filter_gptconfig_kwargs(self, d: dict) -> dict:
+        """
+        Helper for training handles
+        """
+        sig = inspect.signature(GPTConfig.__init__)
+        allowed = set(sig.parameters.keys()) - {"self"}
+        return {k: v for k, v in d.items() if k in allowed}
+
 
     def _initialize_teacher_if_needed(self):
         teacher_path = getattr(self.args, "distillation_teacher_ckpt", None)
@@ -549,19 +607,23 @@ class Trainer:
 
     def create_optimizer(self):
         optimizer_key = self.args.optimizer
+        def is_main_param(name: str) -> bool:
+            return "side_rehearsal." not in name
+
+        named_main_params = [(n, p) for n, p in self.model.named_parameters() if is_main_param(n)]
+        main_params = [p for _, p in named_main_params]
 
         if optimizer_key == "muon":
-            named = list(self.model.named_parameters())
             exclude = ("embed", "wte", "wpe", "lm_head")
-            hidden = [p for n, p in named if p.ndim >= 2 and all(e not in n for e in exclude)]
-            other = [p for n, p in named if not (p.ndim >= 2 and all(e not in n for e in exclude))]
+            hidden = [p for n, p in named_main_params if p.ndim >= 2 and all(e not in n for e in exclude)]
+            other = [p for n, p in named_main_params if not (p.ndim >= 2 and all(e not in n for e in exclude))]
             param_groups = [
                 {"params": other, "use_muon": False},
                 {"params": hidden, "use_muon": True},
             ]
         else:
             param_groups = [
-                {"params": self.model.parameters(), "lr": self.args.learning_rate}
+                {"params": main_params, "lr": self.args.learning_rate}
             ]
 
         try:
@@ -624,6 +686,402 @@ class Trainer:
                     self.itos = meta['itos']
             else:
                 sys.exit("Error: meta.pkl not found")
+
+    def _maybe_enable_learned_gradient(self):
+        """
+        If command line opens --use_learned_gradient:
+          1) Recursively replace nn.Linear -> QuantLinear in model
+          2) Collect MLP params for all quantization modules, create optimizer for training the MLP parameters
+          3) to(device)
+        """
+        if getattr(self.args, 'use_learned_gradient', False):
+            
+            # Replace linear
+            self.model, self.quantizers, self.weight_param_groups = replace_linear_with_quantlinear(
+                self.model,
+                bits=self.args.learned_gradient_bits,
+                act_hidden=self.args.gs_hidden,
+                w_hidden=self.args.gs_hidden,
+                bound_low=self.args.gs_bound_low,
+                bound_high=self.args.gs_bound_high,
+                quantize_activation=self.args.learned_gradient_quantize_activations,
+                quantize_weight=self.args.learned_gradient_quantize_weights,
+            )
+
+            # Colect all parameters for MLP
+            theta_params = []
+            for q in self.quantizers:
+                theta_params += list(q.mlp.parameters())
+            if len(theta_params) == 0:
+                print("[learned-gradient] dosen't detect any MLP parameter, check the replacement logic")
+                return
+            # Optimizer only for theta(MLP param), could replace to Muon
+            self.theta_opt = torch.optim.Adam(theta_params, lr=self.args.theta_lr)
+            # Device Verification
+            self.model.to(self.device)
+            print(f"[learned-Derivative] Opened:{len(self.quantizers)} round-MLP,θ Learned rate={self.args.theta_lr:g}")
+            return
+        
+        if getattr(self.args, 'use_linear_fakequant', False):
+            self.model, self.quantizers, self.weight_param_groups = replace_linear_with_quantlinear(
+                self.model,
+                bits=self.args.learned_gradient_bits,  
+                act_hidden=self.args.gs_hidden, w_hidden=self.args.gs_hidden,
+                bound_low=self.args.gs_bound_low, bound_high=self.args.gs_bound_high,
+                quantize_activation=self.args.learned_gradient_quantize_activations,
+                quantize_weight=self.args.learned_gradient_quantize_weights,
+                quantizer_type="ste",
+            )
+            self.theta_opt = None  # No θ
+            self.model.to(self.device)
+            print(f"[fake-quant][STE] Opened:{len(self.quantizers)} quantizer(s); no θ to train.")
+
+    def _annotate_quantized_linear_paths(self):
+        for module_name, module in self.model.named_modules():
+            if isinstance(module, QuantizedLinear):
+                module.module_path = module_name
+
+    def _resolve_side_rehearsal_targets(self):
+        target_specs = list(self.args.side_rehearsal_targets or ["last_mlp_down"])
+        resolved = []
+        for spec in target_specs:
+            if spec == "last_mlp_down":
+                resolved.append(f"transformer.h.{self.model.config.n_layer - 1}.mlp.c_proj")
+            else:
+                resolved.append(spec)
+        return resolved
+
+    def _maybe_enable_side_rehearsal(self):
+        if not getattr(self.args, "use_side_rehearsal", False):
+            return
+        if self.args.compile:
+            raise ValueError("side rehearsal currently does not support --compile.")
+        if self.args.training_mode != "single":
+            raise ValueError("side rehearsal currently supports only training_mode=single.")
+
+        self._annotate_quantized_linear_paths()
+        target_names = self._resolve_side_rehearsal_targets()
+        modules = dict(self.model.named_modules())
+        missing = [name for name in target_names if name not in modules]
+        if missing:
+            raise ValueError(f"side rehearsal target(s) not found: {missing}")
+
+        wrong_type = [
+            name for name in target_names
+            if not isinstance(modules[name], QuantizedLinear)
+        ]
+        if wrong_type:
+            raise TypeError(
+                "side rehearsal currently supports QuantizedLinear targets only; "
+                f"unsupported target(s): {wrong_type}"
+            )
+
+        self.model.side_rehearsal = SideRehearsalCollection(
+            target_names=target_names,
+            hidden_dim=self.args.side_rehearsal_hidden,
+        ).to(self.device)
+        self.side_rehearsal = self.model.side_rehearsal
+        self.side_rehearsal_targets = target_names
+        self.side_rehearsal_pending = {}
+        self.side_rehearsal_opt = torch.optim.Adam(
+            self.side_rehearsal.parameters(),
+            lr=self.args.side_rehearsal_lr,
+        )
+        if self.master_process:
+            print(
+                "[side-rehearsal] enabled for targets:",
+                ", ".join(self.side_rehearsal_targets),
+            )
+
+    def _select_pending_side_target(self):
+        for target_name in self.side_rehearsal_targets:
+            if target_name in self.side_rehearsal_pending:
+                return target_name
+        return None
+
+    def _build_side_piggyback_context(self, x: Optional[torch.Tensor]):
+        if not getattr(self.args, "use_side_rehearsal", False):
+            return None
+        if x is None or x.ndim == 0:
+            return None
+        target_name = self._select_pending_side_target()
+        if target_name is None:
+            return None
+
+        pending_state = self.side_rehearsal_pending[target_name]
+        piggyback_k = max(1, int(math.ceil(x.size(0) * self.args.side_rehearsal_piggyback_ratio)))
+        piggyback_k = min(piggyback_k, x.size(0))
+        return PiggybackContext(
+            target_name=target_name,
+            side_net=self.side_rehearsal.get_net(target_name),
+            pending_state=pending_state,
+            piggyback_k=piggyback_k,
+            base_batch_size=x.size(0),
+        )
+
+    def _reduce_mean_if_ddp(self, value: torch.Tensor) -> torch.Tensor:
+        if not self.ddp:
+            return value
+        reduced = value.detach().clone()
+        dist.all_reduce(reduced, op=dist.ReduceOp.SUM)
+        reduced /= self.ddp_world_size
+        return reduced
+
+    def _target_module(self, target_name: str):
+        return dict(self.raw_model.named_modules())[target_name]
+
+    def _maybe_commit_side_candidate(self, piggyback_ctx: Optional[PiggybackContext]):
+        if piggyback_ctx is None or not piggyback_ctx.has_probe:
+            return None
+
+        base_probe_loss = self._reduce_mean_if_ddp(piggyback_ctx.base_probe_loss.detach().float())
+        candidate_probe_loss = self._reduce_mean_if_ddp(piggyback_ctx.candidate_probe_loss.detach().float())
+        accepted = bool(candidate_probe_loss.item() < base_probe_loss.item())
+
+        if accepted and self.args.side_rehearsal_commit:
+            module = self._target_module(piggyback_ctx.target_name)
+            with torch.no_grad():
+                module.weight.copy_(piggyback_ctx.candidate_weight.detach().to(module.weight.dtype))
+
+        metrics = {
+            "target_name": piggyback_ctx.target_name,
+            "source_iter": piggyback_ctx.pending_state.source_iter,
+            "base_probe_loss": float(base_probe_loss.item()),
+            "candidate_probe_loss": float(candidate_probe_loss.item()),
+            "delta": float((base_probe_loss - candidate_probe_loss).item()),
+            "accepted": int(accepted),
+            "piggyback_k": int(piggyback_ctx.injected_k),
+            "snapshot_mb": float(self._pending_state_megabytes(piggyback_ctx.pending_state)),
+        }
+        self.side_rehearsal_last_eval = metrics
+        del self.side_rehearsal_pending[piggyback_ctx.target_name]
+        return metrics
+
+    def _optimizer_lr_for_param(self, param: torch.nn.Parameter) -> float:
+        for group in self.optimizer.param_groups:
+            for group_param in group["params"]:
+                if group_param is param:
+                    return float(group.get("lr", self.lr))
+        return float(self.lr)
+
+    def _should_capture_side_state(self) -> bool:
+        return (
+            getattr(self.args, "use_side_rehearsal", False)
+            and self.side_rehearsal is not None
+            and self.args.side_rehearsal_every > 0
+            and ((self.iter_num + 1) % self.args.side_rehearsal_every == 0)
+        )
+
+    def _capture_side_rehearsal_states(self):
+        if not self._should_capture_side_state():
+            return
+        for target_name in self.side_rehearsal_targets:
+            module = self._target_module(target_name)
+            if module.weight.grad is None:
+                continue
+            self.side_rehearsal_pending[target_name] = PendingRehearsalState(
+                target_name=target_name,
+                weight_before_step=module.weight.detach().cpu().clone(),
+                gradient=module.weight.grad.detach().cpu().clone(),
+                learning_rate=self._optimizer_lr_for_param(module.weight),
+                source_iter=self.iter_num,
+            )
+
+    def _pending_state_megabytes(self, pending_state: PendingRehearsalState) -> float:
+        total_bytes = (
+            pending_state.weight_before_step.numel() * pending_state.weight_before_step.element_size()
+            + pending_state.gradient.numel() * pending_state.gradient.element_size()
+        )
+        return total_bytes / (1024 ** 2)
+
+    def _write_side_rehearsal_csv(self, metrics: dict):
+        csv_full_dir = self.args.csv_dir
+        if self.args.csv_ckpt_dir:
+            csv_full_dir = f"{self.args.csv_dir}/{self.args.csv_ckpt_dir}"
+        else:
+            if self.args.tensorboard_log:
+                sanitized_dataset = self.args.dataset.replace("/", "_")
+                csv_full_dir = (
+                    f"{self.args.csv_dir}/"
+                    f"{sanitized_dataset}_{self.args.tensorboard_run_name}"
+                )
+        os.makedirs(csv_full_dir, exist_ok=True)
+        safe_csv_name = self.args.csv_name.replace("/", "_")
+        csv_path = os.path.join(csv_full_dir, f"side_{safe_csv_name}.csv")
+        need_header = not os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as file:
+            writer = csv.writer(file)
+            if need_header:
+                writer.writerow([
+                    "iter",
+                    "target_name",
+                    "source_iter",
+                    "base_probe_loss",
+                    "candidate_probe_loss",
+                    "delta",
+                    "accepted",
+                    "piggyback_k",
+                    "snapshot_mb",
+                    "lr",
+                    "batch_size",
+                    "tokens_trained",
+                    "peak_gpu_mb",
+                    "iter_latency_ms",
+                ])
+            writer.writerow([
+                self.iter_num,
+                metrics["target_name"],
+                metrics["source_iter"],
+                metrics["base_probe_loss"],
+                metrics["candidate_probe_loss"],
+                metrics["delta"],
+                metrics["accepted"],
+                metrics["piggyback_k"],
+                metrics["snapshot_mb"],
+                self.lr,
+                self.args.batch_size,
+                self.tokens_trained,
+                self.peak_gpu_usage / (1024 ** 2) if hasattr(self, "peak_gpu_usage") else float("nan"),
+                self.iter_latency_avg,
+            ])
+
+    def _log_side_rehearsal_metrics(self, metrics: Optional[dict]):
+        if metrics is None:
+            return
+        if self.args.csv_log and self.master_process:
+            self._write_side_rehearsal_csv(metrics)
+        if self.args.tensorboard_log and self.writer is not None:
+            prefix = "side_rehearsal"
+            self.writer.add_scalar(f"{prefix}/base_probe_loss", metrics["base_probe_loss"], self.iter_num)
+            self.writer.add_scalar(f"{prefix}/candidate_probe_loss", metrics["candidate_probe_loss"], self.iter_num)
+            self.writer.add_scalar(f"{prefix}/delta", metrics["delta"], self.iter_num)
+            self.writer.add_scalar(f"{prefix}/accepted", metrics["accepted"], self.iter_num)
+            self.writer.add_scalar(f"{prefix}/snapshot_mb", metrics["snapshot_mb"], self.iter_num)
+
+
+    def do_outer_step_T1(self):
+        """
+        Meta-Learning in the outer
+          Batch A: Normal Network Traverse: Collect g(A), and cache quantization error at each round point
+          Summarize S_l in each layer
+          Construct W' = W - lr * s_l(theta) * g_A , g_A as a constant
+          Batch B: Another forward pass, use W' to replace W
+          Forward gets L_B(W'), only update θ (Parameter for learned MLP)
+        """
+        if not (getattr(self.args, 'use_learned_gradient', False) and self.theta_opt is not None):
+            return None, None
+        if self.args.training_mode != 'single':
+            return None, None
+
+        raw_model = self.model.module if self.ddp else self.model  # DDP 时取裸模型
+        raw_model.train()
+
+        # ---- Batch A ----
+        XA, YA, _ = self.get_batch('train')
+        raw_model.zero_grad(set_to_none=True)
+        with self.ctx: 
+            outA = raw_model(XA,
+                             targets=YA,
+                             iter_num=self.iter_num,
+                             dataset_idx=0 if self.args.multidataset_wte else None,
+                             loss_fn=self.loss_fn)
+        if isinstance(outA, (tuple, list)):
+            _, lossA = outA
+        else:
+            lossA = outA
+        lossA.backward()  
+
+        # Get g_A
+        named_params = list(raw_model.named_parameters())
+        gA = {name: (p.grad.detach().clone() if (p.grad is not None) else torch.zeros_like(p))
+              for name, p in named_params}
+        raw_model.zero_grad(set_to_none=True)
+
+        # ---- Accumulate s_l(theta) from cache ----
+        '''
+        name_to_sl = {}
+        for q in self.quantizers:
+            if not getattr(q, "_has_cache", False):
+                continue
+            s_l = q.group_scale_for_outer(allow_grad_to_theta=True)  
+            layer_name = q.name.split('.act')[0].split('.w')[0] + '.weight'
+            name_to_sl.setdefault(layer_name, []).append(s_l)
+        for k in list(name_to_sl.keys()):
+            name_to_sl[k] = torch.stack(name_to_sl[k]).mean()
+        '''
+        # 设定每次外环最多参与的层数（也可做成 argparse 参数）
+        max_outer_layers = getattr(self.args, "outer_layers", 8)
+
+        # 只从“有缓存”的 quantizer 里随机抽样一小部分参与外环
+        cached_q = [q for q in self.quantizers if getattr(q, "_has_cache", False)]
+        active_q = random.sample(cached_q, k=min(max_outer_layers, len(cached_q)))
+
+        name_to_sl = {}
+        for q in active_q:
+            s_l = q.group_scale_for_outer(allow_grad_to_theta=True)  # 只有这部分会建图
+            layer_name = q.name.split('.act')[0].split('.w')[0] + '.weight'
+            name_to_sl.setdefault(layer_name, []).append(s_l)
+
+        for k in list(name_to_sl.keys()):
+            name_to_sl[k] = torch.stack(name_to_sl[k]).mean()
+
+        # ---- Construct W' = W - lr * s_l(theta) * g_A ----
+        base_lr = self.optimizer.param_groups[0]['lr']
+        Wprime = {}
+        for name, p in named_params:
+            if name in name_to_sl and name in gA:
+                sl = name_to_sl[name]         
+                g = gA[name]                  
+                Wprime[name] = p - base_lr * (sl * g)
+            else:
+                Wprime[name] = p
+
+        # ---- Batch B ----
+        XB, YB, _ = self.get_batch('train')
+        if self.ddp:
+            # stateless.functional_call requires bare model
+            model_for_call = raw_model
+        else:
+            model_for_call = self.model
+
+        # 1) Turn off requires_grad
+        requires = [p.requires_grad for _, p in named_params]
+        for _, p in named_params:
+            p.requires_grad_(False)
+            
+        try:
+            # 2) Only keep autograd for theta，model params participate in calculation as constant
+            with torch.set_grad_enabled(True), self.ctx:
+                outB = stateless.functional_call(
+                    model_for_call,
+                    Wprime,
+                    args=(XB,),
+                    kwargs=dict(
+                        targets=YB,
+                        iter_num=self.iter_num,
+                        dataset_idx=0 if self.args.multidataset_wte else None,
+                        loss_fn=self.loss_fn,
+                    ),
+                )
+                if isinstance(outB, (tuple, list)):
+                    _, lossB = outB
+                else:
+                    lossB = outB
+        
+        # 3) Only upsate theta in packprop
+            self.theta_opt.zero_grad(set_to_none=True)
+            lossB.backward()
+            self.theta_opt.step()
+        
+        finally:
+            for req, (_, p) in zip(requires, named_params):
+                p.requires_grad_(req)
+            torch.cuda.empty_cache()
+
+        for q in self.quantizers:
+            q.clear_cache()
+
+        return float(lossA.detach().cpu()), float(lossB.detach().cpu())
 
     @torch.no_grad()
     def sample_and_print(self):
@@ -1611,6 +2069,7 @@ class Trainer:
         checkpoint = {
                 'model': self.raw_model.state_dict(),
                 'optimizer': self.optimizer.state_dict() if self.optimizer else None,
+                'side_rehearsal_optimizer': self.side_rehearsal_opt.state_dict() if self.side_rehearsal_opt else None,
                 'scheduler': self.scheduler.state_dict() if self.scheduler else None,
                 'model_args': self.model_args,
                 'iter_num': self.iter_num,
@@ -1934,26 +2393,37 @@ class Trainer:
                 if self.args.eval_only:
                     break
 
+                # === Do outer each outer_k steps（T=1）, only uodates θ（round‑MLP） ===
+                if (getattr(self.args, 'use_learned_gradient', False)
+                    and (self.theta_opt is not None)
+                    and (self.iter_num > 0)
+                    and (self.iter_num % self.args.outer_k == 0)):
+                    try:
+                        lossA_meta, lossB_meta = self.do_outer_step_T1()
+                        if lossA_meta is not None and self.args.csv_log:
+                            self.write_to_csv("outer_meta", lossA_meta, lossB_meta, prefix="outer_")
+                        if lossA_meta is not None:
+                            self.console.print(
+                                f"[learned-gradient][outer] iter {self.iter_num}: "
+                                f"lossA={lossA_meta:.4f}, lossB={lossB_meta:.4f}"
+                            )
+                    except Exception as e:
+                        self.console.print(f"[yellow]Outer step skips{e}[/yellow]")
+
+                side_piggyback_ctx = None
+                side_loss = None
+                side_params = None
 
                 for micro_step in range(self.args.gradient_accumulation_steps):
                     if self.ddp:
                         self.model.require_backward_grad_sync = (micro_step == self.args.gradient_accumulation_steps - 1)
 
-                    with self.ctx:
-                        if self.args.training_mode == 'multicontext':
-                            total_loss = 0
-                            logits, training_losses = self.model(
-                                None,
-                                token_dict=self.X_dict,
-                                target_dict=self.Y_dict,
-                                iter_num=self.iter_num,
-                                loss_fn=self.loss_fn,
-                            )
+                    current_piggyback_ctx = None
+                    if self.args.training_mode != 'multicontext' and micro_step == 0:
+                        current_piggyback_ctx = self._build_side_piggyback_context(self.X)
 
-                            # For multicontext training let loss = first dataset loss
-                            # loss = training_losses[0]
-                            loss = sum(training_losses) / len(training_losses)
-                        else:
+                    if current_piggyback_ctx is not None:
+                        with activate_piggyback_context(current_piggyback_ctx), self.ctx:
                             idx_ds = self.args.dataset_list.index(current_dataset) if self.args.dataset_list else None
                             logits, loss = self.model(
                                 self.X,
@@ -1962,6 +2432,30 @@ class Trainer:
                                 dataset_idx=idx_ds if self.args.multidataset_wte else None,
                                 loss_fn=self.loss_fn,
                             )
+                    else:
+                        with self.ctx:
+                            if self.args.training_mode == 'multicontext':
+                                total_loss = 0
+                                logits, training_losses = self.model(
+                                    None,
+                                    token_dict=self.X_dict,
+                                    target_dict=self.Y_dict,
+                                    iter_num=self.iter_num,
+                                    loss_fn=self.loss_fn,
+                                )
+
+                                # For multicontext training let loss = first dataset loss
+                                # loss = training_losses[0]
+                                loss = sum(training_losses) / len(training_losses)
+                            else:
+                                idx_ds = self.args.dataset_list.index(current_dataset) if self.args.dataset_list else None
+                                logits, loss = self.model(
+                                    self.X,
+                                    targets=self.Y,
+                                    iter_num=self.iter_num,
+                                    dataset_idx=idx_ds if self.args.multidataset_wte else None,
+                                    loss_fn=self.loss_fn,
+                                )
 
                     if hasattr(self.optimizer, "set_entropy") and not isinstance(logits, (list, tuple)):
                         with torch.no_grad():
@@ -2001,6 +2495,16 @@ class Trainer:
 
                     loss = loss / self.args.gradient_accumulation_steps
 
+                    if current_piggyback_ctx is not None and current_piggyback_ctx.has_probe:
+                        side_piggyback_ctx = current_piggyback_ctx
+                        side_loss = (
+                            current_piggyback_ctx.candidate_probe_loss
+                            - current_piggyback_ctx.base_probe_loss.detach()
+                        )
+                        side_params = list(
+                            self.side_rehearsal.get_net(current_piggyback_ctx.target_name).parameters()
+                        )
+
                     prior_dataset = current_dataset
                     tokens_trained_this_batch = self.args.batch_size * self.args.block_size
                     if self.args.dataset_list:
@@ -2017,7 +2521,10 @@ class Trainer:
                         else:
                             current_epoch = self.tokens_trained / self.dataset_size_tokens
 
-                    self.scaler.scale(loss).backward()
+                    retain_graph = current_piggyback_ctx is not None and current_piggyback_ctx.has_probe
+                    self.scaler.scale(loss).backward(retain_graph=retain_graph)
+                    if retain_graph and side_loss is not None and side_params is not None:
+                        self.scaler.scale(side_loss).backward(inputs=side_params)
 
                     # measure grad norms
                     self.get_gradient_stats()
@@ -2035,6 +2542,8 @@ class Trainer:
                 # ---- Unscale ONCE (so logged grads are real grads, not scaled grads) ----
                 if self.scaler.is_enabled():
                     self.scaler.unscale_(self.optimizer)
+                    if self.side_rehearsal_opt is not None and side_piggyback_ctx is not None and side_piggyback_ctx.has_probe:
+                        self.scaler.unscale_(self.side_rehearsal_opt)
                     
                 # ---- Log bit tables (CSV) after unscale, before clipping/step ----
                 if self.master_process and getattr(self, "bit_logger", None) is not None:
@@ -2073,7 +2582,22 @@ class Trainer:
                             self.latest_overall_activation_stats.get(stat_key, 0.0)
                             )
 
+                side_metrics = self._maybe_commit_side_candidate(side_piggyback_ctx)
+                self._log_side_rehearsal_metrics(side_metrics)
+                if side_metrics is not None and self.master_process:
+                    self.console.print(
+                        "[side-rehearsal] "
+                        f"iter {self.iter_num} target={side_metrics['target_name']} "
+                        f"base={side_metrics['base_probe_loss']:.4f} "
+                        f"cand={side_metrics['candidate_probe_loss']:.4f} "
+                        f"delta={side_metrics['delta']:.4f} "
+                        f"accepted={side_metrics['accepted']}"
+                    )
+                self._capture_side_rehearsal_states()
+
                 self.scaler.step(self.optimizer)
+                if self.side_rehearsal_opt is not None and side_piggyback_ctx is not None and side_piggyback_ctx.has_probe:
+                    self.scaler.step(self.side_rehearsal_opt)
                 self.scaler.update()
                 if self.scheduler:
                     if isinstance(self.scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -2082,6 +2606,8 @@ class Trainer:
                         self.scheduler.step()
 
                 self.optimizer.zero_grad(set_to_none=True)
+                if self.side_rehearsal_opt is not None:
+                    self.side_rehearsal_opt.zero_grad(set_to_none=True)
 
                 t1 = time.time()
                 dt = t1 - t0
@@ -2190,4 +2716,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
