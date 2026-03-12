@@ -858,7 +858,8 @@ class Trainer:
 
         base_probe_loss = self._reduce_mean_if_ddp(piggyback_ctx.base_probe_loss.detach().float())
         candidate_probe_loss = self._reduce_mean_if_ddp(piggyback_ctx.candidate_probe_loss.detach().float())
-        accepted = bool(candidate_probe_loss.item() < base_probe_loss.item())
+        delta_value = base_probe_loss.item() - candidate_probe_loss.item()
+        accepted = bool(delta_value > self.args.side_rehearsal_accept_margin)
 
         if accepted and self.args.side_rehearsal_commit:
             module = self._target_module(piggyback_ctx.target_name)
@@ -874,7 +875,7 @@ class Trainer:
             "source_iter": piggyback_ctx.pending_state.source_iter,
             "base_probe_loss": float(base_probe_loss.item()),
             "candidate_probe_loss": float(candidate_probe_loss.item()),
-            "delta": float((base_probe_loss - candidate_probe_loss).item()),
+            "delta": float(delta_value),
             "accepted": int(accepted),
             "piggyback_k": int(piggyback_ctx.injected_k),
             "snapshot_mb": float(self._pending_state_megabytes(piggyback_ctx.pending_state)),
@@ -924,6 +925,46 @@ class Trainer:
                 if group_param is param:
                     return group
         raise KeyError("Parameter not found in optimizer param_groups.")
+
+    def _quant_local_features(self, module: QuantizedLinear, weight: torch.Tensor) -> torch.Tensor:
+        weight = weight.detach().to(torch.float32)
+        method = module.quant_method
+        bits = int(module.weight_bits)
+
+        if method == "symmetric_quant":
+            qmax = (1 << (bits - 1)) - 1
+            qmin = -qmax - 1
+            scale = weight.abs().max() / max(qmax, 1)
+            scale = torch.clamp(scale, min=1e-8)
+            scaled = weight / scale
+        elif method == "affine_quant":
+            qmax = (1 << (bits - 1)) - 1
+            qmin = -qmax - 1
+            w_max = weight.max()
+            w_min = weight.min()
+            scale = (w_max - w_min) / max((1 << bits) - 1, 1)
+            scale = torch.clamp(scale, min=1e-8)
+            zero_point = -torch.round(w_min / scale) + qmin
+            scaled = weight / scale + zero_point
+        else:
+            zeros = torch.zeros_like(weight)
+            return torch.stack((zeros, zeros, zeros, zeros), dim=-1).cpu()
+
+        clamped = torch.clamp(scaled, min=qmin, max=qmax)
+        rounded = torch.round(clamped)
+        round_residual = clamped - rounded
+        clamp_mask = ((scaled < qmin) | (scaled > qmax)).to(weight.dtype)
+        boundary_distance = torch.minimum(clamped - qmin, qmax - clamped) / max(float(qmax - qmin), 1.0)
+        normalized_position = clamped / max(float(max(abs(qmin), abs(qmax))), 1.0)
+        return torch.stack(
+            (
+                round_residual,
+                clamp_mask,
+                boundary_distance,
+                normalized_position,
+            ),
+            dim=-1,
+        ).cpu()
 
     def _adamw_snapshot_for_param(self, param: torch.nn.Parameter) -> dict:
         group = self._optimizer_group_for_param(param)
@@ -975,6 +1016,7 @@ class Trainer:
                 adamw_step=opt_snapshot["adamw_step"],
                 exp_avg=opt_snapshot["exp_avg"],
                 exp_avg_sq=opt_snapshot["exp_avg_sq"],
+                quant_features=self._quant_local_features(module, module.weight),
                 source_iter=self.iter_num,
             )
 
@@ -982,6 +1024,7 @@ class Trainer:
         total_bytes = (
             pending_state.weight_before_step.numel() * pending_state.weight_before_step.element_size()
             + pending_state.gradient.numel() * pending_state.gradient.element_size()
+            + pending_state.quant_features.numel() * pending_state.quant_features.element_size()
         )
         return total_bytes / (1024 ** 2)
 

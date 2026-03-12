@@ -1345,6 +1345,12 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         help="If candidate loss improves, replace the target weight before the optimizer step.",
     )
+    training_group.add_argument(
+        '--side_rehearsal_accept_margin',
+        type=float,
+        default=5e-5,
+        help="Minimum loss improvement required before accepting the candidate weight.",
+    )
 
 
     

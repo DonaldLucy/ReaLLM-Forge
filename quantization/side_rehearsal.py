@@ -19,20 +19,29 @@ def _sanitize_target_name(name: str) -> str:
 class GradientSideNet(nn.Module):
     """Two-layer element-wise MLP that predicts a residual correction to the gradient."""
 
-    def __init__(self, hidden_dim: int = 32):
+    def __init__(self, hidden_dim: int = 32, input_dim: int = 6):
         super().__init__()
-        self.fc1 = nn.Linear(1, hidden_dim)
+        self.input_dim = input_dim
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
         self.act = nn.GELU()
         self.fc2 = nn.Linear(hidden_dim, 1)
         nn.init.zeros_(self.fc2.weight)
         nn.init.zeros_(self.fc2.bias)
 
-    def forward(self, grad: torch.Tensor) -> torch.Tensor:
+    def forward(self, grad: torch.Tensor, quant_features: torch.Tensor) -> torch.Tensor:
         grad_dtype = grad.dtype
         grad_shape = grad.shape
-        x = grad.reshape(-1, 1).to(self.fc1.weight.dtype)
+        feature_list = [
+            grad,
+            grad.abs(),
+            quant_features[..., 0],
+            quant_features[..., 1],
+            quant_features[..., 2],
+            quant_features[..., 3],
+        ]
+        x = torch.stack(feature_list, dim=-1).reshape(-1, self.input_dim).to(self.fc1.weight.dtype)
         delta = self.fc2(self.act(self.fc1(x)))
-        corrected = x + delta
+        corrected = grad.reshape(-1, 1).to(delta.dtype) + delta
         return corrected.reshape(grad_shape).to(grad_dtype)
 
 
@@ -71,6 +80,7 @@ class PendingRehearsalState:
     adamw_step: int
     exp_avg: torch.Tensor
     exp_avg_sq: torch.Tensor
+    quant_features: torch.Tensor
     source_iter: int
 
 
@@ -116,7 +126,8 @@ class PiggybackContext:
             base_weight = self.pending_state.weight_before_step.to(device=device, dtype=dtype)
             exp_avg = self.pending_state.exp_avg.to(device=device, dtype=dtype)
             exp_avg_sq = self.pending_state.exp_avg_sq.to(device=device, dtype=dtype)
-            corrected_grad = self.side_net(grad)
+            quant_features = self.pending_state.quant_features.to(device=device, dtype=dtype)
+            corrected_grad = self.side_net(grad, quant_features)
             next_step = self.pending_state.adamw_step + 1
 
             exp_avg = exp_avg.mul(self.pending_state.beta1).add(
