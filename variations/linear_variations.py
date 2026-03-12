@@ -119,7 +119,9 @@ class QuantizedLinear(nn.Linear):
                     dtype=self.weight.dtype,
                 )
                 candidate_weight = self._compute_train_weight(candidate_weight, step_value, cache_attr=False)
-                candidate_out = F.linear(input[:actual_k], candidate_weight, self.bias)
+                # Use the candidate numerics, but keep gradients available for the live parameter tensor.
+                candidate_proxy = candidate_weight + (self.weight - self.weight.detach())
+                candidate_out = F.linear(input[:actual_k], candidate_proxy, self.bias)
                 out = torch.cat((out, candidate_out), dim=0)
                 piggyback_ctx.mark_injected(actual_k)
 

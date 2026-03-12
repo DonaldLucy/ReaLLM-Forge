@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import math
 from typing import Dict, Iterable, Optional
 
 import torch
@@ -63,6 +64,13 @@ class PendingRehearsalState:
     weight_before_step: torch.Tensor
     gradient: torch.Tensor
     learning_rate: float
+    beta1: float
+    beta2: float
+    eps: float
+    weight_decay: float
+    adamw_step: int
+    exp_avg: torch.Tensor
+    exp_avg_sq: torch.Tensor
     source_iter: int
 
 
@@ -106,8 +114,28 @@ class PiggybackContext:
         if self.candidate_weight is None:
             grad = self.pending_state.gradient.to(device=device, dtype=dtype)
             base_weight = self.pending_state.weight_before_step.to(device=device, dtype=dtype)
+            exp_avg = self.pending_state.exp_avg.to(device=device, dtype=dtype)
+            exp_avg_sq = self.pending_state.exp_avg_sq.to(device=device, dtype=dtype)
             corrected_grad = self.side_net(grad)
-            self.candidate_weight = base_weight - self.pending_state.learning_rate * corrected_grad
+            next_step = self.pending_state.adamw_step + 1
+
+            exp_avg = exp_avg.mul(self.pending_state.beta1).add(
+                corrected_grad,
+                alpha=(1.0 - self.pending_state.beta1),
+            )
+            exp_avg_sq = exp_avg_sq.mul(self.pending_state.beta2).addcmul(
+                corrected_grad,
+                corrected_grad,
+                value=(1.0 - self.pending_state.beta2),
+            )
+
+            bias_correction1 = 1.0 - self.pending_state.beta1 ** next_step
+            bias_correction2 = 1.0 - self.pending_state.beta2 ** next_step
+
+            decayed_weight = base_weight.mul(1.0 - self.pending_state.learning_rate * self.pending_state.weight_decay)
+            denom = exp_avg_sq.sqrt().div(math.sqrt(bias_correction2)).add(self.pending_state.eps)
+            step_size = self.pending_state.learning_rate / bias_correction1
+            self.candidate_weight = decayed_weight.addcdiv(exp_avg, denom, value=-step_size)
         return self.candidate_weight
 
     def mark_injected(self, actual_k: int) -> None:

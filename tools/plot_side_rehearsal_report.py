@@ -46,7 +46,12 @@ def load_bulk_csv(path):
 
     for key, values in data.items():
         data[key] = np.asarray(values, dtype=float)
-    data["hours"] = np.cumsum(np.nan_to_num(data["iter_ms"], nan=0.0)) / 3_600_000.0
+    if data["iter"].size:
+        delta_iters = np.diff(data["iter"], prepend=data["iter"][0])
+        delta_iters[0] = max(1.0, data["iter"][0] if data["iter"][0] > 0 else 1.0)
+        data["hours"] = np.cumsum(np.nan_to_num(data["iter_ms"], nan=0.0) * delta_iters) / 3_600_000.0
+    else:
+        data["hours"] = np.asarray([], dtype=float)
     return data
 
 

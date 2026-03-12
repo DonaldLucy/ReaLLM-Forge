@@ -228,6 +228,7 @@ class Trainer:
         self.side_rehearsal_targets = []
         self.side_rehearsal_pending = {}
         self.side_rehearsal_last_eval = None
+        self.main_backward_params = []
         
         self.setup()
 
@@ -634,6 +635,9 @@ class Trainer:
                              f"Available: {list(optimizer_dictionary)}")
 
         optimizer = optimizer_builder(param_groups, self.args)
+        self.main_backward_params = [
+            p for group in param_groups for p in group["params"]
+        ]
 
         return optimizer
 
@@ -759,6 +763,13 @@ class Trainer:
             raise ValueError("side rehearsal currently does not support --compile.")
         if self.args.training_mode != "single":
             raise ValueError("side rehearsal currently supports only training_mode=single.")
+        if self.args.optimizer != "adamw":
+            raise ValueError("The strict side rehearsal path currently supports optimizer=adamw only.")
+        if self.args.gradient_accumulation_steps != 1:
+            raise ValueError(
+                "The strict side rehearsal path requires gradient_accumulation_steps=1. "
+                "Please increase micro-batch size instead of accumulating micro-steps."
+            )
 
         self._annotate_quantized_linear_paths()
         target_names = self._resolve_side_rehearsal_targets()
@@ -831,6 +842,48 @@ class Trainer:
     def _target_module(self, target_name: str):
         return dict(self.raw_model.named_modules())[target_name]
 
+    def _prepare_side_rehearsal_step(
+        self,
+        piggyback_ctx: Optional[PiggybackContext],
+        base_loss: torch.Tensor,
+    ):
+        if piggyback_ctx is None or not piggyback_ctx.has_probe:
+            return base_loss, None, None, None
+
+        if piggyback_ctx.injected_k != piggyback_ctx.base_batch_size:
+            raise ValueError(
+                "Strict side rehearsal expects piggyback_k == batch_size. "
+                "Use --side_rehearsal_piggyback_ratio 1.0."
+            )
+
+        base_probe_loss = self._reduce_mean_if_ddp(piggyback_ctx.base_probe_loss.detach().float())
+        candidate_probe_loss = self._reduce_mean_if_ddp(piggyback_ctx.candidate_probe_loss.detach().float())
+        accepted = bool(candidate_probe_loss.item() < base_probe_loss.item())
+
+        if accepted and self.args.side_rehearsal_commit:
+            module = self._target_module(piggyback_ctx.target_name)
+            with torch.no_grad():
+                module.weight.copy_(piggyback_ctx.candidate_weight.detach().to(module.weight.dtype))
+
+        selected_loss = piggyback_ctx.candidate_probe_loss if accepted else base_loss
+        side_loss = piggyback_ctx.candidate_probe_loss - piggyback_ctx.base_probe_loss.detach()
+        side_params = list(self.side_rehearsal.get_net(piggyback_ctx.target_name).parameters())
+
+        metrics = {
+            "target_name": piggyback_ctx.target_name,
+            "source_iter": piggyback_ctx.pending_state.source_iter,
+            "base_probe_loss": float(base_probe_loss.item()),
+            "candidate_probe_loss": float(candidate_probe_loss.item()),
+            "delta": float((base_probe_loss - candidate_probe_loss).item()),
+            "accepted": int(accepted),
+            "piggyback_k": int(piggyback_ctx.injected_k),
+            "snapshot_mb": float(self._pending_state_megabytes(piggyback_ctx.pending_state)),
+        }
+        self.side_rehearsal_last_eval = metrics
+        del self.side_rehearsal_pending[piggyback_ctx.target_name]
+
+        return selected_loss, side_loss, side_params, metrics
+
     def _maybe_commit_side_candidate(self, piggyback_ctx: Optional[PiggybackContext]):
         if piggyback_ctx is None or not piggyback_ctx.has_probe:
             return None
@@ -865,6 +918,35 @@ class Trainer:
                     return float(group.get("lr", self.lr))
         return float(self.lr)
 
+    def _optimizer_group_for_param(self, param: torch.nn.Parameter):
+        for group in self.optimizer.param_groups:
+            for group_param in group["params"]:
+                if group_param is param:
+                    return group
+        raise KeyError("Parameter not found in optimizer param_groups.")
+
+    def _adamw_snapshot_for_param(self, param: torch.nn.Parameter) -> dict:
+        group = self._optimizer_group_for_param(param)
+        state = self.optimizer.state.get(param, {})
+        exp_avg = state.get("exp_avg", torch.zeros_like(param, device=param.device, dtype=torch.float32))
+        exp_avg_sq = state.get("exp_avg_sq", torch.zeros_like(param, device=param.device, dtype=torch.float32))
+        step_value = state.get("step", 0)
+        if isinstance(step_value, torch.Tensor):
+            step_value = int(step_value.item())
+        else:
+            step_value = int(step_value)
+
+        return {
+            "learning_rate": float(group.get("lr", self.lr)),
+            "beta1": float(group.get("betas", (self.args.beta1, self.args.beta2))[0]),
+            "beta2": float(group.get("betas", (self.args.beta1, self.args.beta2))[1]),
+            "eps": float(group.get("eps", self.args.adamw_eps)),
+            "weight_decay": float(group.get("weight_decay", self.args.adamw_weight_decay)),
+            "adamw_step": step_value,
+            "exp_avg": exp_avg.detach().cpu().clone(),
+            "exp_avg_sq": exp_avg_sq.detach().cpu().clone(),
+        }
+
     def _should_capture_side_state(self) -> bool:
         return (
             getattr(self.args, "use_side_rehearsal", False)
@@ -880,11 +962,19 @@ class Trainer:
             module = self._target_module(target_name)
             if module.weight.grad is None:
                 continue
+            opt_snapshot = self._adamw_snapshot_for_param(module.weight)
             self.side_rehearsal_pending[target_name] = PendingRehearsalState(
                 target_name=target_name,
                 weight_before_step=module.weight.detach().cpu().clone(),
                 gradient=module.weight.grad.detach().cpu().clone(),
-                learning_rate=self._optimizer_lr_for_param(module.weight),
+                learning_rate=opt_snapshot["learning_rate"],
+                beta1=opt_snapshot["beta1"],
+                beta2=opt_snapshot["beta2"],
+                eps=opt_snapshot["eps"],
+                weight_decay=opt_snapshot["weight_decay"],
+                adamw_step=opt_snapshot["adamw_step"],
+                exp_avg=opt_snapshot["exp_avg"],
+                exp_avg_sq=opt_snapshot["exp_avg_sq"],
                 source_iter=self.iter_num,
             )
 
@@ -2411,9 +2501,8 @@ class Trainer:
                     except Exception as e:
                         self.console.print(f"[yellow]Outer step skips{e}[/yellow]")
 
-                side_piggyback_ctx = None
-                side_loss = None
-                side_params = None
+                side_metrics = None
+                train_loss_for_logging = None
 
                 for micro_step in range(self.args.gradient_accumulation_steps):
                     if self.ddp:
@@ -2494,17 +2583,17 @@ class Trainer:
                         else float('nan')
                     )
 
-                    loss = loss / self.args.gradient_accumulation_steps
+                    selected_loss, current_side_loss, current_side_params, current_side_metrics = self._prepare_side_rehearsal_step(
+                        current_piggyback_ctx,
+                        loss,
+                    )
+                    if current_side_metrics is not None:
+                        side_metrics = current_side_metrics
+                    train_loss_for_logging = selected_loss.detach()
 
-                    if current_piggyback_ctx is not None and current_piggyback_ctx.has_probe:
-                        side_piggyback_ctx = current_piggyback_ctx
-                        side_loss = (
-                            current_piggyback_ctx.candidate_probe_loss
-                            - current_piggyback_ctx.base_probe_loss.detach()
-                        )
-                        side_params = list(
-                            self.side_rehearsal.get_net(current_piggyback_ctx.target_name).parameters()
-                        )
+                    selected_loss = selected_loss / self.args.gradient_accumulation_steps
+                    if current_side_loss is not None:
+                        current_side_loss = current_side_loss / self.args.gradient_accumulation_steps
 
                     prior_dataset = current_dataset
                     tokens_trained_this_batch = self.args.batch_size * self.args.block_size
@@ -2522,10 +2611,13 @@ class Trainer:
                         else:
                             current_epoch = self.tokens_trained / self.dataset_size_tokens
 
-                    retain_graph = current_piggyback_ctx is not None and current_piggyback_ctx.has_probe
-                    self.scaler.scale(loss).backward(retain_graph=retain_graph)
-                    if retain_graph and side_loss is not None and side_params is not None:
-                        self.scaler.scale(side_loss).backward(inputs=side_params)
+                    retain_graph = current_side_loss is not None and current_side_params is not None
+                    self.scaler.scale(selected_loss).backward(
+                        retain_graph=retain_graph,
+                        inputs=self.main_backward_params,
+                    )
+                    if retain_graph:
+                        self.scaler.scale(current_side_loss).backward(inputs=current_side_params)
 
                     # measure grad norms
                     self.get_gradient_stats()
@@ -2543,7 +2635,7 @@ class Trainer:
                 # ---- Unscale ONCE (so logged grads are real grads, not scaled grads) ----
                 if self.scaler.is_enabled():
                     self.scaler.unscale_(self.optimizer)
-                    if self.side_rehearsal_opt is not None and side_piggyback_ctx is not None and side_piggyback_ctx.has_probe:
+                    if self.side_rehearsal_opt is not None and side_metrics is not None:
                         self.scaler.unscale_(self.side_rehearsal_opt)
                     
                 # ---- Log bit tables (CSV) after unscale, before clipping/step ----
@@ -2583,7 +2675,6 @@ class Trainer:
                             self.latest_overall_activation_stats.get(stat_key, 0.0)
                             )
 
-                side_metrics = self._maybe_commit_side_candidate(side_piggyback_ctx)
                 self._log_side_rehearsal_metrics(side_metrics)
                 if side_metrics is not None and self.master_process:
                     self.console.print(
@@ -2597,7 +2688,7 @@ class Trainer:
                 self._capture_side_rehearsal_states()
 
                 self.scaler.step(self.optimizer)
-                if self.side_rehearsal_opt is not None and side_piggyback_ctx is not None and side_piggyback_ctx.has_probe:
+                if self.side_rehearsal_opt is not None and side_metrics is not None:
                     self.scaler.step(self.side_rehearsal_opt)
                 self.scaler.update()
                 if self.scheduler:
@@ -2634,7 +2725,8 @@ class Trainer:
                 local_iter_num += 1
 
                 if self.iter_num % self.args.log_interval == 0 and self.master_process:
-                    lossf = loss.item() * self.args.gradient_accumulation_steps
+                    log_loss = train_loss_for_logging if train_loss_for_logging is not None else loss.detach()
+                    lossf = log_loss.item() * self.args.gradient_accumulation_steps
                     if local_iter_num >= 5:
                         mfu = self.raw_model.estimate_mfu(self.args.batch_size * self.args.gradient_accumulation_steps, dt)
                         running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
