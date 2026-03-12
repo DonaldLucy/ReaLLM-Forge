@@ -12,6 +12,7 @@ N_LAYER="${N_LAYER:-18}"
 N_HEAD="${N_HEAD:-16}"
 N_KV_GROUP="${N_KV_GROUP:-8}"
 N_EMBD="${N_EMBD:-1024}"
+QUANT_BITS="${QUANT_BITS:-8}"
 
 BLOCK_SIZE="${BLOCK_SIZE:-512}"
 BATCH_SIZE_PER_GPU="${BATCH_SIZE_PER_GPU:-6}"
@@ -70,7 +71,7 @@ TRAIN_ARGS=(
   --quantization_warmup_iters 0
   --linear_variant_mlp_down quantized_linear
   --quantize_linear_mlp_down_method symmetric_quant
-  --quantize_linear_mlp_down_bits 8
+  --quantize_linear_mlp_down_bits "${QUANT_BITS}"
   --use_side_rehearsal
   --side_rehearsal_targets last_mlp_down
   --side_rehearsal_every 10

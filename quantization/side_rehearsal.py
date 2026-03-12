@@ -105,6 +105,9 @@ class PiggybackContext:
         self.injected = False
         self.injected_k = 0
         self.candidate_weight: Optional[torch.Tensor] = None
+        self.candidate_exp_avg: Optional[torch.Tensor] = None
+        self.candidate_exp_avg_sq: Optional[torch.Tensor] = None
+        self.candidate_adamw_step: Optional[int] = None
         self.base_probe_loss: Optional[torch.Tensor] = None
         self.candidate_probe_loss: Optional[torch.Tensor] = None
 
@@ -147,6 +150,9 @@ class PiggybackContext:
             denom = exp_avg_sq.sqrt().div(math.sqrt(bias_correction2)).add(self.pending_state.eps)
             step_size = self.pending_state.learning_rate / bias_correction1
             self.candidate_weight = decayed_weight.addcdiv(exp_avg, denom, value=-step_size)
+            self.candidate_exp_avg = exp_avg
+            self.candidate_exp_avg_sq = exp_avg_sq
+            self.candidate_adamw_step = next_step
         return self.candidate_weight
 
     def mark_injected(self, actual_k: int) -> None:
